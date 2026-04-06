@@ -1,15 +1,18 @@
-"""
+﻿"""
 TTS model initialization and management
 """
 
-import os
 import asyncio
+import os
 from enum import Enum
-from typing import Optional, Dict, Any
-from chatterbox.tts import ChatterboxTTS
+from typing import Any, Dict, Optional
+
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-from app.core.mtl import SUPPORTED_LANGUAGES
+from chatterbox.tts import ChatterboxTTS
+
 from app.config import Config, detect_device
+from .engine import load_t3_state_dict, resolve_t3_checkpoint
+from app.core.mtl import SUPPORTED_LANGUAGES
 
 # Global model instance
 _model = None
@@ -19,6 +22,7 @@ _initialization_error = None
 _initialization_progress = ""
 _is_multilingual = None
 _supported_languages = {}
+_checkpoint_path = None
 
 
 class InitializationState(Enum):
@@ -30,87 +34,121 @@ class InitializationState(Enum):
 
 async def initialize_model():
     """Initialize the Chatterbox TTS model"""
-    global _model, _device, _initialization_state, _initialization_error, _initialization_progress, _is_multilingual, _supported_languages
-    
+    global \
+        _model, \
+        _device, \
+        _initialization_state, \
+        _initialization_error, \
+        _initialization_progress, \
+        _is_multilingual, \
+        _supported_languages, \
+        _checkpoint_path
+
     try:
         _initialization_state = InitializationState.INITIALIZING.value
         _initialization_progress = "Validating configuration..."
-        
+
         Config.validate()
         _device = detect_device()
-        
+
         print(f"Initializing Chatterbox TTS model...")
         print(f"Device: {_device}")
         print(f"Voice sample: {Config.VOICE_SAMPLE_PATH}")
         print(f"Model cache: {Config.MODEL_CACHE_DIR}")
-        
+        if Config.TTS_CHECKPOINT_PATH:
+            print(f"T3 checkpoint: {Config.TTS_CHECKPOINT_PATH}")
+
         _initialization_progress = "Creating model cache directory..."
-        # Ensure model cache directory exists
         os.makedirs(Config.MODEL_CACHE_DIR, exist_ok=True)
-        
+
         _initialization_progress = "Checking voice sample..."
-        # Check voice sample exists
         if not os.path.exists(Config.VOICE_SAMPLE_PATH):
-            raise FileNotFoundError(f"Voice sample not found: {Config.VOICE_SAMPLE_PATH}")
-        
+            raise FileNotFoundError(
+                f"Voice sample not found: {Config.VOICE_SAMPLE_PATH}"
+            )
+
         _initialization_progress = "Configuring device compatibility..."
-        # Patch torch.load for CPU compatibility if needed
-        if _device == 'cpu':
+        if _device == "cpu":
             import torch
+
             original_load = torch.load
             original_load_file = None
-            
-            # Try to patch safetensors if available
+
             try:
                 import safetensors.torch
+
                 original_load_file = safetensors.torch.load_file
             except ImportError:
                 pass
-            
+
             def force_cpu_torch_load(f, map_location=None, **kwargs):
-                # Always force CPU mapping if we're on a CPU device
-                return original_load(f, map_location='cpu', **kwargs)
-            
+                return original_load(f, map_location="cpu", **kwargs)
+
             def force_cpu_load_file(filename, device=None):
-                # Force CPU for safetensors loading too
-                return original_load_file(filename, device='cpu')
-            
+                return original_load_file(filename, device="cpu")
+
             torch.load = force_cpu_torch_load
             if original_load_file:
                 safetensors.torch.load_file = force_cpu_load_file
-        
-        # Determine if we should use multilingual model
+
         use_multilingual = Config.USE_MULTILINGUAL_MODEL
-        
+
         _initialization_progress = "Loading TTS model (this may take a while)..."
-        # Initialize model with run_in_executor for non-blocking
         loop = asyncio.get_event_loop()
-        
+
         if use_multilingual:
-            print(f"Loading Chatterbox Multilingual TTS model...")
+            print("Loading Chatterbox Multilingual TTS model...")
+            _initialization_progress = "Loading multilingual TTS model..."
             _model = await loop.run_in_executor(
-                None, 
-                lambda: ChatterboxMultilingualTTS.from_pretrained(device=_device)
+                None, lambda: ChatterboxMultilingualTTS.from_pretrained(device=_device)
             )
+
+            if Config.TTS_CHECKPOINT_PATH:
+                _initialization_progress = "Resolving custom T3 checkpoint..."
+                resolved_checkpoint = resolve_t3_checkpoint(Config.TTS_CHECKPOINT_PATH)
+                print(f"Resolved T3 checkpoint: {resolved_checkpoint}")
+
+                _initialization_progress = "Applying custom T3 checkpoint..."
+                state_dict = await loop.run_in_executor(
+                    None, lambda: load_t3_state_dict(resolved_checkpoint)
+                )
+                missing, unexpected = _model.t3.load_state_dict(state_dict, strict=False)
+                if missing or unexpected:
+                    raise RuntimeError(
+                        "Checkpoint load mismatch. "
+                        f"missing={missing} unexpected={unexpected} path={resolved_checkpoint}"
+                    )
+                _model.t3.eval()
+                _checkpoint_path = str(resolved_checkpoint)
+            else:
+                _checkpoint_path = None
+
             _is_multilingual = True
             _supported_languages = SUPPORTED_LANGUAGES.copy()
-            print(f"✓ Multilingual model initialized with {len(_supported_languages)} languages")
+            print(
+                f"✓ Multilingual model initialized with {len(_supported_languages)} languages"
+            )
         else:
-            print(f"Loading standard Chatterbox TTS model...")
+            if Config.TTS_CHECKPOINT_PATH:
+                print(
+                    "Warning: TTS_CHECKPOINT_PATH is set but USE_MULTILINGUAL_MODEL is false; "
+                    "ignoring custom checkpoint for standard model startup."
+                )
+            print("Loading standard Chatterbox TTS model...")
             _model = await loop.run_in_executor(
-                None, 
-                lambda: ChatterboxTTS.from_pretrained(device=_device)
+                None, lambda: ChatterboxTTS.from_pretrained(device=_device)
             )
             _is_multilingual = False
-            _supported_languages = {"en": "English"}  # Standard model only supports English
-            print(f"✓ Standard model initialized (English only)")
-        
+            _supported_languages = {"en": "English"}
+            _checkpoint_path = None
+            print("✓ Standard model initialized (English only)")
+
         _initialization_state = InitializationState.READY.value
         _initialization_progress = "Model ready"
         _initialization_error = None
         print(f"✓ Model initialized successfully on {_device}")
         return _model
-        
+
     except Exception as e:
         _initialization_state = InitializationState.ERROR.value
         _initialization_error = str(e)
@@ -146,12 +184,14 @@ def get_initialization_error():
 
 def is_ready():
     """Check if the model is ready for use"""
-    return _initialization_state == InitializationState.READY.value and _model is not None
+    return (
+        _initialization_state == InitializationState.READY.value and _model is not None
+    )
 
 
 def is_initializing():
     """Check if the model is currently initializing"""
-    return _initialization_state == InitializationState.INITIALIZING.value 
+    return _initialization_state == InitializationState.INITIALIZING.value
 
 
 def is_multilingual():
@@ -162,6 +202,11 @@ def is_multilingual():
 def get_supported_languages():
     """Get the dictionary of supported languages"""
     return _supported_languages.copy()
+
+
+def get_checkpoint_path():
+    """Get the resolved custom checkpoint path if one is loaded"""
+    return _checkpoint_path
 
 
 def supports_language(language_id: str):
@@ -177,6 +222,7 @@ def get_model_info() -> Dict[str, Any]:
         "supported_languages": _supported_languages,
         "language_count": len(_supported_languages),
         "device": _device,
+        "checkpoint_path": _checkpoint_path,
         "is_ready": is_ready(),
-        "initialization_state": _initialization_state
+        "initialization_state": _initialization_state,
     }

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Configuration management for Chatterbox TTS API
 """
 
@@ -44,6 +44,7 @@ class Config:
 
     # Multilingual model settings
     USE_MULTILINGUAL_MODEL = os.getenv('USE_MULTILINGUAL_MODEL', 'true').lower() == 'true'
+    TTS_CHECKPOINT_PATH = os.getenv('TTS_CHECKPOINT_PATH', '').strip()
     
     # Memory management settings
     MEMORY_CLEANUP_INTERVAL = int(os.getenv('MEMORY_CLEANUP_INTERVAL', 5))
